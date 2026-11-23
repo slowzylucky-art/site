@@ -7,12 +7,111 @@ app.set("trust proxy", 1);
 const PORT = process.env.PORT || 3000;
 const LOOTLABS_URL = "https://lootdest.org/s?AMGV62R5";
 const KEY_TTL_MS = 24 * 60 * 60 * 1000; // 24 saat
-const MIN_CHECKPOINT_MS = 5000; // Görev için minimum geçiş süresi (5 sn)
-const SECRET = process.env.SESSION_SECRET || "spectre-hub-obsidian-key-2026";
+const MIN_TASK_MS = 10 * 1000; // Görev için minimum 10 saniye
+const SESSION_TTL_MS = 30 * 60 * 1000; // 30 dakika
+const SECRET = process.env.SESSION_SECRET || "spectre-hub-amethyst-secret-2026";
 
 const activeKeys = new Map();
+const pendingSessions = new Map();
 
 app.use(express.json());
+
+function sha256(str) {
+  return crypto.createHash("sha256").update(str).digest("hex").slice(0, 24);
+}
+
+function signToken(payload) {
+  const sig = crypto.createHmac("sha256", SECRET).update(payload).digest("hex").slice(0, 24);
+  return `${payload}.${sig}`;
+}
+
+function verifyToken(signed) {
+  if (!signed || typeof signed !== "string" || !signed.includes(".")) return null;
+  const idx = signed.lastIndexOf(".");
+  const payload = signed.slice(0, idx);
+  const expected = signToken(payload);
+  if (signed.length !== expected.length) return null;
+  return crypto.timingSafeEqual(Buffer.from(signed), Buffer.from(expected)) ? payload : null;
+}
+
+function parseCookies(req) {
+  const header = req.headers.cookie || "";
+  const cookies = {};
+  header.split(";").forEach((part) => {
+    const [k, ...v] = part.trim().split("=");
+    if (k) cookies[k] = decodeURIComponent(v.join("="));
+  });
+  return cookies;
+}
+
+function getClientFingerprint(req) {
+  const ua = String(req.headers["user-agent"] || "");
+  const lang = String(req.headers["accept-language"] || "");
+  return sha256(`${ua}|${lang}`);
+}
+
+function isAutomatedBot(req) {
+  const ua = String(req.headers["user-agent"] || "").toLowerCase();
+  const accept = String(req.headers["accept"] || "");
+  const lang = String(req.headers["accept-language"] || "");
+
+  if (!ua || !lang || !accept) return true;
+
+  const blockedSignatures = [
+    "headless",
+    "puppeteer",
+    "playwright",
+    "selenium",
+    "phantomjs",
+    "curl/",
+    "wget/",
+    "python-requests",
+    "aiohttp",
+    "httpx",
+    "axios",
+    "node-fetch",
+    "undici",
+    "go-http-client",
+    "discordbot",
+    "bot/",
+    "crawler",
+    "spider"
+  ];
+
+  if (blockedSignatures.some((sig) => ua.includes(sig))) return true;
+  if (req.headers["x-requested-with"] === "XMLHttpRequest" && req.method === "GET") return true;
+
+  return false;
+}
+
+function validateCheckpointSession(req) {
+  if (isAutomatedBot(req)) return { ok: false, reason: "Automated client blocked." };
+
+  const cookies = parseCookies(req);
+  const sid = verifyToken(cookies.sp_sid);
+  if (!sid) return { ok: false, reason: "Missing verification session." };
+
+  const session = pendingSessions.get(sid);
+  if (!session || session.used) {
+    return { ok: false, reason: "Session expired or already used." };
+  }
+
+  if (session.fingerprint !== getClientFingerprint(req)) {
+    return { ok: false, reason: "Browser mismatch detected." };
+  }
+
+  const elapsed = Date.now() - session.createdAt;
+  if (elapsed < MIN_TASK_MS) {
+    return { ok: false, reason: "Checkpoint completed too fast." };
+  }
+
+  if (elapsed > SESSION_TTL_MS) {
+    pendingSessions.delete(sid);
+    return { ok: false, reason: "Checkpoint session timed out." };
+  }
+
+  return { ok: true, sid, session };
+}
 
 function generateKey() {
   const p1 = crypto.randomBytes(2).toString("hex").toUpperCase();
@@ -21,67 +120,32 @@ function generateKey() {
   return `SPH-${p1}-${p2}-${p3}`;
 }
 
-function signValue(value) {
-  const sig = crypto.createHmac("sha256", SECRET).update(value).digest("hex").slice(0, 24);
-  return `${value}.${sig}`;
-}
-
-function verifySignedValue(signed) {
-  if (!signed || typeof signed !== "string" || !signed.includes(".")) return null;
-  const idx = signed.lastIndexOf(".");
-  const value = signed.slice(0, idx);
-  const expected = signValue(value);
-  if (signed.length !== expected.length) return null;
-  return crypto.timingSafeEqual(Buffer.from(signed), Buffer.from(expected)) ? value : null;
-}
-
-function parseCookies(req) {
-  const header = req.headers.cookie || "";
-  const out = {};
-  header.split(";").forEach((part) => {
-    const [k, ...v] = part.trim().split("=");
-    if (k) out[k] = decodeURIComponent(v.join("="));
-  });
-  return out;
-}
-
-function hasValidCheckpoint(req) {
-  const cookies = parseCookies(req);
-  const raw = verifySignedValue(cookies.sp_gate);
-  if (!raw) return false;
-  const startedAt = Number(raw);
-  if (!Number.isFinite(startedAt)) return false;
-  const elapsed = Date.now() - startedAt;
-  return elapsed >= MIN_CHECKPOINT_MS && elapsed <= 60 * 60 * 1000;
-}
-
-function cleanExpiredKeys() {
+setInterval(() => {
   const now = Date.now();
   for (const [key, data] of activeKeys.entries()) {
-    if (data.expiresAt <= now) {
-      activeKeys.delete(key);
-    }
+    if (data.expiresAt <= now) activeKeys.delete(key);
   }
-}
+  for (const [sid, data] of pendingSessions.entries()) {
+    if (now - data.createdAt > SESSION_TTL_MS) pendingSessions.delete(sid);
+  }
+}, 5 * 60 * 1000);
 
-setInterval(cleanExpiredKeys, 10 * 60 * 1000);
-
-const SHARED_STYLES = `
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap');
+const SHARED_UI = `
+  @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap');
 
   :root {
-    --bg: #050608;
-    --card: #0c0f14;
-    --surface: #131822;
-    --border: rgba(255, 255, 255, 0.08);
-    --border-accent: rgba(56, 189, 248, 0.35);
-    --text: #f8fafc;
-    --muted: #8b95a5;
-    --cyan: #38bdf8;
-    --cyan-hover: #0ea5e9;
-    --cyan-glow: rgba(56, 189, 248, 0.16);
-    --green: #10b981;
-    --red: #ef4444;
+    --bg: #06040d;
+    --card: rgba(14, 10, 26, 0.86);
+    --surface: rgba(24, 17, 44, 0.75);
+    --border: rgba(192, 132, 252, 0.18);
+    --border-bright: rgba(192, 132, 252, 0.48);
+    --text: #faf7ff;
+    --muted: #a79bc2;
+    --purple: #9333ea;
+    --violet: #c084fc;
+    --pink: #e879f9;
+    --green: #34d399;
+    --red: #fb7185;
   }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -91,91 +155,144 @@ const SHARED_STYLES = `
     display: flex;
     align-items: center;
     justify-content: center;
-    background-color: var(--bg);
-    background-image:
-      radial-gradient(circle at 50% 0%, rgba(56, 189, 248, 0.12), transparent 55%),
-      linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
-    background-size: 100% 100%, 32px 32px, 32px 32px;
+    background: var(--bg);
     color: var(--text);
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
     padding: 20px;
+    overflow-x: hidden;
+    position: relative;
   }
 
-  .shell {
+  .aurora {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(circle at 50% -10%, rgba(168, 85, 247, 0.28), transparent 55%),
+      radial-gradient(circle at 85% 85%, rgba(232, 121, 249, 0.14), transparent 45%),
+      radial-gradient(circle at 15% 75%, rgba(124, 58, 237, 0.18), transparent 45%);
+    z-index: 0;
+  }
+
+  #sparkles {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .card {
+    position: relative;
+    z-index: 1;
     width: 100%;
     max-width: 430px;
     background: var(--card);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
     border: 1px solid var(--border);
-    border-radius: 20px;
-    padding: 26px;
-    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(255, 255, 255, 0.02) inset;
+    border-radius: 22px;
+    padding: 28px;
+    box-shadow:
+      0 25px 70px rgba(0, 0, 0, 0.75),
+      0 0 40px rgba(147, 51, 234, 0.16),
+      inset 0 1px 0 rgba(255, 255, 255, 0.12);
+    overflow: hidden;
   }
 
-  .topbar {
+  .card::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: -100%;
+    width: 60%;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, var(--violet), var(--pink), transparent);
+    animation: topShimmer 4s infinite ease-in-out;
+  }
+
+  @keyframes topShimmer {
+    0% { left: -60%; }
+    50%, 100% { left: 130%; }
+  }
+
+  .header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding-bottom: 20px;
-    margin-bottom: 22px;
-    border-bottom: 1px solid var(--border);
+    padding-bottom: 18px;
+    margin-bottom: 20px;
+    border-bottom: 1px solid rgba(192, 132, 252, 0.12);
   }
 
   .brand {
     display: flex;
     align-items: center;
-    gap: 10px;
-    font-weight: 700;
-    font-size: 15px;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
+    gap: 11px;
   }
 
-  .brand-icon {
-    width: 30px;
-    height: 30px;
-    border-radius: 8px;
-    background: linear-gradient(135deg, rgba(56, 189, 248, 0.2), rgba(14, 165, 233, 0.05));
-    border: 1px solid var(--border-accent);
+  .logo-orb {
+    width: 34px;
+    height: 34px;
+    border-radius: 10px;
+    background: linear-gradient(135deg, rgba(168, 85, 247, 0.35), rgba(232, 121, 249, 0.15));
+    border: 1px solid var(--border-bright);
     display: flex;
     align-items: center;
     justify-content: center;
-    color: var(--cyan);
+    color: #f3e8ff;
+    box-shadow: 0 0 18px rgba(168, 85, 247, 0.45);
   }
 
-  .badge {
+  .brand-name {
+    font-size: 16px;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    background: linear-gradient(90deg, #ffffff, #e9d5ff, #f5d0fe);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  .status-pill {
     display: inline-flex;
     align-items: center;
     gap: 6px;
     font-family: 'JetBrains Mono', monospace;
     font-size: 11px;
-    font-weight: 500;
+    font-weight: 700;
     color: var(--green);
-    background: rgba(16, 185, 129, 0.1);
-    border: 1px solid rgba(16, 185, 129, 0.25);
+    background: rgba(52, 211, 153, 0.1);
+    border: 1px solid rgba(52, 211, 153, 0.28);
     padding: 4px 10px;
     border-radius: 999px;
   }
 
-  .dot {
+  .pulse {
     width: 6px;
     height: 6px;
     border-radius: 50%;
     background: var(--green);
-    box-shadow: 0 0 8px var(--green);
+    box-shadow: 0 0 10px var(--green);
+    animation: pulseGlow 2s infinite;
   }
 
-  .steps {
+  @keyframes pulseGlow {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.45; transform: scale(0.85); }
+  }
+
+  .progress-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 8px;
+    gap: 10px;
     margin-bottom: 22px;
   }
 
-  .step {
+  .pill-step {
     background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 10px;
+    border: 1px solid rgba(192, 132, 252, 0.12);
+    border-radius: 11px;
     padding: 10px 12px;
     font-size: 12px;
     color: var(--muted);
@@ -184,80 +301,112 @@ const SHARED_STYLES = `
     justify-content: space-between;
   }
 
-  .step.active {
-    border-color: var(--border-accent);
+  .pill-step.current {
+    border-color: var(--border-bright);
     color: var(--text);
-    background: rgba(56, 189, 248, 0.06);
+    background: rgba(147, 51, 234, 0.14);
+    box-shadow: inset 0 0 16px rgba(168, 85, 247, 0.12);
   }
 
-  .step.done {
-    border-color: rgba(16, 185, 129, 0.3);
+  .pill-step.complete {
+    border-color: rgba(52, 211, 153, 0.35);
     color: var(--green);
-    background: rgba(16, 185, 129, 0.06);
+    background: rgba(52, 211, 153, 0.08);
   }
 
-  .step-num {
+  .tag {
     font-family: 'JetBrains Mono', monospace;
-    font-size: 11px;
-    opacity: 0.8;
+    font-size: 10px;
+    opacity: 0.85;
   }
 
   h1 {
-    font-size: 22px;
-    font-weight: 700;
+    font-size: 24px;
+    font-weight: 800;
     letter-spacing: -0.02em;
     margin-bottom: 8px;
+    background: linear-gradient(135deg, #ffffff 30%, #d8b4fe 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
   }
 
-  .desc {
+  .subtitle {
     color: var(--muted);
     font-size: 14px;
     line-height: 1.55;
     margin-bottom: 22px;
   }
 
-  .alert {
-    background: rgba(239, 68, 68, 0.1);
-    border: 1px solid rgba(239, 68, 68, 0.3);
-    color: #fca5a5;
+  .warn-box {
+    background: rgba(251, 113, 133, 0.1);
+    border: 1px solid rgba(251, 113, 133, 0.32);
+    color: #fecdd3;
     font-size: 13px;
     padding: 11px 14px;
-    border-radius: 10px;
+    border-radius: 12px;
     margin-bottom: 18px;
   }
 
-  .primary-btn {
+  .shimmer-btn {
+    position: relative;
+    overflow: hidden;
     width: 100%;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 8px;
-    padding: 14px 20px;
-    border: 0;
-    border-radius: 12px;
-    background: var(--cyan);
-    color: #030712;
-    font-family: 'Inter', sans-serif;
+    gap: 9px;
+    padding: 15px 22px;
+    border: 1px solid rgba(232, 121, 249, 0.45);
+    border-radius: 13px;
+    background: linear-gradient(135deg, #7e22ce 0%, #9333ea 50%, #c026d3 100%);
+    color: #ffffff;
+    font-family: 'Plus Jakarta Sans', sans-serif;
     font-size: 15px;
     font-weight: 700;
+    letter-spacing: 0.01em;
     text-decoration: none;
     cursor: pointer;
-    transition: transform 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
-    box-shadow: 0 8px 24px var(--cyan-glow);
+    box-shadow:
+      0 10px 28px rgba(147, 51, 234, 0.45),
+      inset 0 1px 0 rgba(255, 255, 255, 0.3);
+    transition: transform 0.16s ease, box-shadow 0.16s ease;
   }
 
-  .primary-btn:hover {
-    background: var(--cyan-hover);
+  .shimmer-btn::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: -120%;
+    width: 55%;
+    height: 100%;
+    background: linear-gradient(
+      115deg,
+      transparent 0%,
+      rgba(255, 255, 255, 0.35) 50%,
+      transparent 100%
+    );
+    animation: btnSweep 3.2s infinite ease-in-out;
+  }
+
+  @keyframes btnSweep {
+    0% { left: -120%; }
+    45%, 100% { left: 150%; }
+  }
+
+  .shimmer-btn:hover {
     transform: translateY(-1px);
+    box-shadow:
+      0 14px 34px rgba(168, 85, 247, 0.6),
+      inset 0 1px 0 rgba(255, 255, 255, 0.4);
   }
 
-  .primary-btn:disabled {
-    opacity: 0.6;
+  .shimmer-btn:disabled {
+    opacity: 0.65;
     cursor: not-allowed;
     transform: none;
   }
 
-  .footer-note {
+  .meta {
     margin-top: 18px;
     text-align: center;
     font-size: 12px;
@@ -265,15 +414,69 @@ const SHARED_STYLES = `
   }
 `;
 
+const SPARKLE_SCRIPT = `
+  (function () {
+    const canvas = document.getElementById("sparkles");
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    let w, h, particles = [];
+
+    function resize() {
+      w = canvas.width = window.innerWidth;
+      h = canvas.height = window.innerHeight;
+    }
+    window.addEventListener("resize", resize);
+    resize();
+
+    const colors = ["rgba(192,132,252,", "rgba(232,121,249,", "rgba(168,85,247,", "rgba(245,208,254,"];
+    for (let i = 0; i < 34; i++) {
+      particles.push({
+        x: Math.random() * w,
+        y: Math.random() * h,
+        r: Math.random() * 2 + 0.7,
+        vy: -(Math.random() * 0.35 + 0.12),
+        vx: (Math.random() - 0.5) * 0.2,
+        alpha: Math.random() * 0.7 + 0.2,
+        phase: Math.random() * Math.PI * 2,
+        color: colors[i % colors.length]
+      });
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, w, h);
+      for (const p of particles) {
+        p.x += p.vx;
+        p.y += p.vy;
+        p.phase += 0.035;
+        if (p.y < -10) { p.y = h + 10; p.x = Math.random() * w; }
+        if (p.x < -10) p.x = w + 10;
+        if (p.x > w + 10) p.x = -10;
+
+        const twinkle = (Math.sin(p.phase) + 1) * 0.5;
+        const a = (p.alpha * (0.35 + twinkle * 0.65)).toFixed(2);
+
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+        ctx.fillStyle = p.color + a + ")";
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = "rgba(192, 132, 252, 0.8)";
+        ctx.fill();
+      }
+      requestAnimationFrame(draw);
+    }
+    draw();
+  })();
+`;
+
 // Health check
 app.get("/health", (req, res) => {
   res.status(200).json({ status: "ok", service: "spectre-hub" });
 });
 
-// Get Key Portal (Ana Sayfa)
+// Ana Sayfa (Get Key)
 app.get("/", (req, res) => {
-  const bypassAlert = req.query.error === "bypass"
-    ? `<div class="alert">Checkpoint incomplete. Click <strong>Get Key</strong> and finish the verification first.</div>`
+  const errorNotice = req.query.error === "bypass"
+    ? `<div class="warn-box">Bypass blocked. Click <strong>Get Key</strong> and complete the checkpoint in this browser.</div>`
     : "";
 
   res.type("html").send(`<!DOCTYPE html>
@@ -282,35 +485,36 @@ app.get("/", (req, res) => {
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Spectre Hub — Key System</title>
-  <style>${SHARED_STYLES}</style>
+  <style>${SHARED_UI}</style>
 </head>
 <body>
-  <div class="shell">
-    <div class="topbar">
+  <div class="aurora"></div>
+  <canvas id="sparkles"></canvas>
+
+  <div class="card">
+    <div class="header">
       <div class="brand">
-        <div class="brand-icon">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-            <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
-            <polyline points="2 17 12 22 22 17"></polyline>
-            <polyline points="2 12 12 17 22 12"></polyline>
+        <div class="logo-orb">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <path d="M12 2L15 9L22 12L15 15L12 22L9 15L2 12L9 9L12 2Z"></path>
           </svg>
         </div>
-        <span>Spectre Hub</span>
+        <span class="brand-name">SPECTRE HUB</span>
       </div>
-      <div class="badge"><span class="dot"></span>ONLINE</div>
+      <div class="status-pill"><span class="pulse"></span>ONLINE</div>
     </div>
 
-    <div class="steps">
-      <div class="step active"><span>1. Checkpoint</span><span class="step-num">ACTIVE</span></div>
-      <div class="step"><span>2. Access Key</span><span class="step-num">LOCKED</span></div>
+    <div class="progress-grid">
+      <div class="pill-step current"><span>1. Checkpoint</span><span class="tag">ACTIVE</span></div>
+      <div class="pill-step"><span>2. Access Key</span><span class="tag">LOCKED</span></div>
     </div>
 
-    ${bypassAlert}
+    ${errorNotice}
 
     <h1>Get Access Key</h1>
-    <p class="desc">Complete one quick security checkpoint to unlock your 24-hour Spectre Hub license key.</p>
+    <p class="subtitle">Complete the verification step to unlock your 24-hour Spectre Hub license key.</p>
 
-    <a class="primary-btn" href="/go">
+    <a class="shimmer-btn" href="/go">
       <span>Get Key</span>
       <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4">
         <line x1="5" y1="12" x2="19" y2="12"></line>
@@ -318,31 +522,47 @@ app.get("/", (req, res) => {
       </svg>
     </a>
 
-    <div class="footer-note">Duration: 24 Hours &bull; Instant Activation</div>
+    <div class="meta">24-Hour License &bull; Protected Session</div>
   </div>
+
+  <script>${SPARKLE_SCRIPT}</script>
 </body>
 </html>`);
 });
 
-// Anti-bypass kapısı: Oturum başlatır ve LootLabs'a yönlendirir
+// Anti-Bypass Oturum Başlatıcı
 app.get("/go", (req, res) => {
-  const token = signValue(String(Date.now()));
+  if (isAutomatedBot(req)) {
+    return res.status(403).send("Automated requests are not allowed.");
+  }
+
+  const sid = crypto.randomBytes(16).toString("hex");
+  pendingSessions.set(sid, {
+    createdAt: Date.now(),
+    fingerprint: getClientFingerprint(req),
+    used: false
+  });
+
+  const signedSid = signToken(sid);
   res.setHeader(
     "Set-Cookie",
-    `sp_gate=${encodeURIComponent(token)}; Path=/; Max-Age=3600; HttpOnly; SameSite=Lax`
+    `sp_sid=${encodeURIComponent(signedSid)}; Path=/; Max-Age=1800; HttpOnly; SameSite=Lax`
   );
-  res.redirect(302, LOOTLABS_URL);
+  return res.redirect(302, LOOTLABS_URL);
 });
 
-// Claim Key Vault (Görev sonrası ekran)
+// Claim Key Ekranı
 app.get("/claim", (req, res) => {
   const cookies = parseCookies(req);
   const existingKey = cookies.sp_key;
   const existingRecord = existingKey ? activeKeys.get(existingKey) : null;
   const hasActiveKey = existingRecord && existingRecord.expiresAt > Date.now();
 
-  if (!hasActiveKey && !hasValidCheckpoint(req)) {
-    return res.redirect(302, "/?error=bypass");
+  if (!hasActiveKey) {
+    const check = validateCheckpointSession(req);
+    if (!check.ok) {
+      return res.redirect(302, "/?error=bypass");
+    }
   }
 
   res.type("html").send(`<!DOCTYPE html>
@@ -350,51 +570,52 @@ app.get("/claim", (req, res) => {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Spectre Hub — Access Vault</title>
+  <title>Spectre Hub — Claim Key</title>
   <style>
-    ${SHARED_STYLES}
+    ${SHARED_UI}
 
-    .vault {
+    .key-vault {
       display: none;
       margin-top: 18px;
       background: var(--surface);
-      border: 1px solid var(--border-accent);
-      border-radius: 14px;
+      border: 1px solid var(--border-bright);
+      border-radius: 15px;
       padding: 16px;
+      box-shadow: inset 0 0 24px rgba(168, 85, 247, 0.14);
     }
 
-    .vault-label {
+    .vault-top {
       display: flex;
-      justify-content: space-between;
       align-items: center;
-      font-size: 11px;
+      justify-content: space-between;
       font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
       color: var(--muted);
       margin-bottom: 10px;
       text-transform: uppercase;
     }
 
-    .timer {
-      color: var(--cyan);
+    .countdown {
+      color: var(--pink);
       font-weight: 700;
     }
 
-    .key-row {
+    .key-box {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 10px;
-      background: #080a0e;
-      border: 1px solid var(--border);
-      border-radius: 10px;
+      background: rgba(7, 5, 16, 0.9);
+      border: 1px solid rgba(192, 132, 252, 0.25);
+      border-radius: 11px;
       padding: 12px 14px;
     }
 
-    .key-text {
+    .key-value {
       font-family: 'JetBrains Mono', monospace;
       font-size: 14px;
       font-weight: 700;
-      color: var(--text);
+      color: #f3e8ff;
       letter-spacing: 0.04em;
       user-select: all;
       overflow-x: auto;
@@ -402,150 +623,148 @@ app.get("/claim", (req, res) => {
 
     .copy-btn {
       flex-shrink: 0;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 8px 12px;
-      border-radius: 8px;
-      border: 1px solid var(--border);
-      background: var(--card);
-      color: var(--text);
-      font-family: 'Inter', sans-serif;
+      padding: 8px 13px;
+      border-radius: 9px;
+      border: 1px solid var(--border-bright);
+      background: rgba(147, 51, 234, 0.22);
+      color: #f5d0fe;
+      font-family: 'Plus Jakarta Sans', sans-serif;
       font-size: 12px;
-      font-weight: 600;
+      font-weight: 700;
       cursor: pointer;
       transition: all 0.15s ease;
     }
 
     .copy-btn:hover {
-      border-color: var(--cyan);
-      color: var(--cyan);
+      background: rgba(168, 85, 247, 0.38);
+      color: #ffffff;
     }
 
     .copy-btn.copied {
-      border-color: rgba(16, 185, 129, 0.45);
+      border-color: rgba(52, 211, 153, 0.5);
+      background: rgba(52, 211, 153, 0.16);
       color: var(--green);
-      background: rgba(16, 185, 129, 0.08);
     }
 
-    .status-line {
+    .msg {
       margin-top: 12px;
+      text-align: center;
       font-size: 12px;
       color: var(--muted);
-      text-align: center;
       min-height: 16px;
     }
   </style>
 </head>
 <body>
-  <div class="shell">
-    <div class="topbar">
+  <div class="aurora"></div>
+  <canvas id="sparkles"></canvas>
+
+  <div class="card">
+    <div class="header">
       <div class="brand">
-        <div class="brand-icon">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-            <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
-            <polyline points="2 17 12 22 22 17"></polyline>
-            <polyline points="2 12 12 17 22 12"></polyline>
+        <div class="logo-orb">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <path d="M12 2L15 9L22 12L15 15L12 22L9 15L2 12L9 9L12 2Z"></path>
           </svg>
         </div>
-        <span>Spectre Hub</span>
+        <span class="brand-name">SPECTRE HUB</span>
       </div>
-      <div class="badge"><span class="dot"></span>VERIFIED</div>
+      <div class="status-pill"><span class="pulse"></span>VERIFIED</div>
     </div>
 
-    <div class="steps">
-      <div class="step done"><span>1. Checkpoint</span><span class="step-num">DONE</span></div>
-      <div class="step active"><span>2. Access Key</span><span class="step-num">READY</span></div>
+    <div class="progress-grid">
+      <div class="pill-step complete"><span>1. Checkpoint</span><span class="tag">DONE</span></div>
+      <div class="pill-step current"><span>2. Access Key</span><span class="tag">READY</span></div>
     </div>
 
     <h1>Access Unlocked</h1>
-    <p class="desc">Verification complete. Generate your 24-hour key below and paste it into the Spectre Hub loader.</p>
+    <p class="subtitle">Verification complete. Claim your 24-hour key below and paste it into the Spectre Hub script.</p>
 
-    <button id="claimBtn" class="primary-btn" type="button">
+    <button id="claimBtn" class="shimmer-btn" type="button">
       <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3">
         <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"></path>
       </svg>
-      <span id="claimBtnText">Generate Access Key</span>
+      <span id="claimLabel">Claim Key</span>
     </button>
 
-    <div id="vault" class="vault">
-      <div class="vault-label">
-        <span>License Key</span>
-        <span id="timer" class="timer">24h 00m 00s</span>
+    <div id="vault" class="key-vault">
+      <div class="vault-top">
+        <span>Your Key</span>
+        <span id="timer" class="countdown">24h 00m 00s</span>
       </div>
-      <div class="key-row">
-        <span id="keyText" class="key-text"></span>
+      <div class="key-box">
+        <span id="keyValue" class="key-value"></span>
         <button id="copyBtn" class="copy-btn" type="button">Copy</button>
       </div>
     </div>
 
-    <div id="statusLine" class="status-line"></div>
+    <div id="msg" class="msg"></div>
   </div>
 
   <script>
+    ${SPARKLE_SCRIPT}
+
     const claimBtn = document.getElementById("claimBtn");
-    const claimBtnText = document.getElementById("claimBtnText");
+    const claimLabel = document.getElementById("claimLabel");
     const vault = document.getElementById("vault");
-    const keyText = document.getElementById("keyText");
+    const keyValue = document.getElementById("keyValue");
     const copyBtn = document.getElementById("copyBtn");
     const timerEl = document.getElementById("timer");
-    const statusLine = document.getElementById("statusLine");
+    const msgEl = document.getElementById("msg");
 
-    let currentKey = "";
+    let activeKey = "";
     let expiresAt = 0;
-    let timerInterval = null;
+    let intervalId = null;
 
-    function updateTimer() {
-      const diff = expiresAt - Date.now();
-      if (diff <= 0) {
+    function tickTimer() {
+      const left = expiresAt - Date.now();
+      if (left <= 0) {
         timerEl.textContent = "EXPIRED";
-        clearInterval(timerInterval);
+        clearInterval(intervalId);
         return;
       }
-      const h = String(Math.floor(diff / 3600000)).padStart(2, "0");
-      const m = String(Math.floor((diff % 3600000) / 60000)).padStart(2, "0");
-      const s = String(Math.floor((diff % 60000) / 1000)).padStart(2, "0");
+      const h = String(Math.floor(left / 3600000)).padStart(2, "0");
+      const m = String(Math.floor((left % 3600000) / 60000)).padStart(2, "0");
+      const s = String(Math.floor((left % 60000) / 1000)).padStart(2, "0");
       timerEl.textContent = h + "h " + m + "m " + s + "s";
     }
 
-    function showKey(key, exp) {
-      currentKey = key;
+    function revealKey(key, exp) {
+      activeKey = key;
       expiresAt = exp;
-      keyText.textContent = key;
+      keyValue.textContent = key;
       vault.style.display = "block";
       claimBtn.style.display = "none";
-      statusLine.textContent = "Active session bound to this browser.";
-      updateTimer();
-      if (timerInterval) clearInterval(timerInterval);
-      timerInterval = setInterval(updateTimer, 1000);
+      msgEl.textContent = "Key bound to this browser session.";
+      tickTimer();
+      if (intervalId) clearInterval(intervalId);
+      intervalId = setInterval(tickTimer, 1000);
     }
 
-    async function requestKey() {
+    claimBtn.addEventListener("click", async () => {
       claimBtn.disabled = true;
-      claimBtnText.textContent = "Generating...";
+      claimLabel.textContent = "Generating...";
       try {
         const res = await fetch("/api/claim-key", { method: "POST" });
         const data = await res.json();
         if (!res.ok || !data.key) {
-          throw new Error(data.error || "Verification required.");
+          throw new Error(data.error || "Verification failed.");
         }
-        showKey(data.key, data.expiresAt);
+        revealKey(data.key, data.expiresAt);
       } catch (err) {
-        statusLine.textContent = err.message;
+        msgEl.textContent = err.message;
         claimBtn.disabled = false;
-        claimBtnText.textContent = "Generate Access Key";
+        claimLabel.textContent = "Claim Key";
       }
-    }
-
-    claimBtn.addEventListener("click", requestKey);
+    });
 
     copyBtn.addEventListener("click", async () => {
-      if (!currentKey) return;
+      if (!activeKey) return;
       try {
-        await navigator.clipboard.writeText(currentKey);
+        await navigator.clipboard.writeText(activeKey);
       } catch {
         const ta = document.createElement("textarea");
-        ta.value = currentKey;
+        ta.value = activeKey;
         document.body.appendChild(ta);
         ta.select();
         document.execCommand("copy");
@@ -563,9 +782,12 @@ app.get("/claim", (req, res) => {
 </html>`);
 });
 
-// Key üretme veya aktif key'i döndürme API'si
+// Tek Kullanımlık Oturum Yakan Key API
 app.post("/api/claim-key", (req, res) => {
-  cleanExpiredKeys();
+  if (isAutomatedBot(req)) {
+    return res.status(403).json({ error: "Automated requests blocked." });
+  }
+
   const cookies = parseCookies(req);
   const existingKey = cookies.sp_key;
 
@@ -576,25 +798,29 @@ app.post("/api/claim-key", (req, res) => {
     }
   }
 
-  if (!hasValidCheckpoint(req)) {
-    return res.status(403).json({ error: "Checkpoint not completed." });
+  const check = validateCheckpointSession(req);
+  if (!check.ok) {
+    return res.status(403).json({ error: check.reason });
   }
+
+  // Oturumu tek seferlik yak (tekrar kullanılamaz)
+  check.session.used = true;
+  pendingSessions.delete(check.sid);
 
   const key = generateKey();
   const expiresAt = Date.now() + KEY_TTL_MS;
   activeKeys.set(key, { createdAt: Date.now(), expiresAt });
 
-  res.setHeader(
-    "Set-Cookie",
-    `sp_key=${encodeURIComponent(key)}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax`
-  );
+  res.setHeader("Set-Cookie", [
+    `sp_key=${encodeURIComponent(key)}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax`,
+    `sp_sid=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`
+  ]);
 
   return res.status(200).json({ key, expiresAt });
 });
 
-// Script tarafı Key doğrulama ucu
+// Lua Script Key Doğrulama Ucu
 app.get("/api/verify-key", (req, res) => {
-  cleanExpiredKeys();
   const key = String(req.query.key || "").trim();
   const record = activeKeys.get(key);
 
@@ -603,7 +829,10 @@ app.get("/api/verify-key", (req, res) => {
     return res.status(401).json({ valid: false, error: "Invalid or expired key" });
   }
 
-  return res.status(200).json({ valid: true, expiresAt: record.expiresAt });
+  return res.status(200).json({
+    valid: true,
+    expiresAt: record.expiresAt
+  });
 });
 
 app.listen(PORT, () => {
