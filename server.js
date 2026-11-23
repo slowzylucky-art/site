@@ -6,7 +6,6 @@ const PORT = process.env.PORT || 3000;
 const LOOTLABS_URL = "https://lootdest.org/s?AMGV62R5";
 const KEY_TTL_MS = 24 * 60 * 60 * 1000; // 24 saat
 
-// Bellekte tutulan aktif key'ler (Render ücretsiz planda restart olursa sıfırlanır)
 const activeKeys = new Map();
 
 app.use(express.json());
@@ -91,7 +90,7 @@ app.get("/", (req, res) => {
 </html>`);
 });
 
-// Claim Key sayfası (Görev bittikten sonra buraya yönlendirilecek)
+// Claim Key sayfası
 app.get("/claim", (req, res) => {
   res.type("html").send(`<!DOCTYPE html>
 <html lang="en">
