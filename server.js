@@ -5,9 +5,10 @@ const app = express();
 app.set("trust proxy", 1);
 
 const PORT = process.env.PORT || 3000;
-const LOOTLABS_URL = "https://lootdest.org/s?AMGV62R5";
+const BASE_LOOTLABS_URL = "https://lootdest.org/s?Q9e8wVMX";
+const LOOTLABS_API_TOKEN = (process.env.LOOTLABS_API_TOKEN || "").trim();
 const KEY_TTL_MS = 24 * 60 * 60 * 1000; // 24 saat
-const MIN_TASK_MS = 10 * 1000; // Görev için minimum 10 saniye
+const MIN_TASK_MS = 15 * 1000; // Minimum 15 saniye görev süresi
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30 dakika
 const SECRET = process.env.SESSION_SECRET || "spectre-hub-amethyst-secret-2026";
 
@@ -57,57 +58,85 @@ function isAutomatedBot(req) {
 
   if (!ua || !lang || !accept) return true;
 
-  const blockedSignatures = [
-    "headless",
-    "puppeteer",
-    "playwright",
-    "selenium",
-    "phantomjs",
-    "curl/",
-    "wget/",
-    "python-requests",
-    "aiohttp",
-    "httpx",
-    "axios",
-    "node-fetch",
-    "undici",
-    "go-http-client",
-    "discordbot",
-    "bot/",
-    "crawler",
-    "spider"
+  const blocked = [
+    "headless", "puppeteer", "playwright", "selenium", "phantomjs",
+    "curl/", "wget/", "python-requests", "aiohttp", "httpx",
+    "axios", "node-fetch", "undici", "go-http-client",
+    "discordbot", "bot/", "crawler", "spider"
   ];
 
-  if (blockedSignatures.some((sig) => ua.includes(sig))) return true;
-  if (req.headers["x-requested-with"] === "XMLHttpRequest" && req.method === "GET") return true;
-
-  return false;
+  return blocked.some((sig) => ua.includes(sig));
 }
 
-function validateCheckpointSession(req) {
-  if (isAutomatedBot(req)) return { ok: false, reason: "Automated client blocked." };
+function isAllowedLootlabsReferer(req) {
+  const ref = String(req.headers["referer"] || "").toLowerCase();
+  if (!ref) return false;
+
+  const blockedBypassers = ["izen.lol", "bypass", "thebypasser", "admaven-bypass"];
+  if (blockedBypassers.some((bad) => ref.includes(bad))) return false;
+
+  const allowedHosts = [
+    "lootdest.org",
+    "lootlabs.gg",
+    "loot-link.com",
+    "loot-links.com",
+    "lootlinks.co",
+    "lootdest.com"
+  ];
+
+  return allowedHosts.some((host) => ref.includes(host));
+}
+
+function burnSession(sid) {
+  if (sid) pendingSessions.delete(sid);
+}
+
+function validateCheckpoint(req, options = { checkRefererAndCallback: true }) {
+  if (isAutomatedBot(req)) {
+    return { ok: false, reason: "Automated client blocked." };
+  }
 
   const cookies = parseCookies(req);
   const sid = verifyToken(cookies.sp_sid);
-  if (!sid) return { ok: false, reason: "Missing verification session." };
+  if (!sid) {
+    return { ok: false, reason: "Missing verification session." };
+  }
 
   const session = pendingSessions.get(sid);
   if (!session || session.used) {
+    burnSession(sid);
     return { ok: false, reason: "Session expired or already used." };
   }
 
   if (session.fingerprint !== getClientFingerprint(req)) {
+    burnSession(sid);
     return { ok: false, reason: "Browser mismatch detected." };
+  }
+
+  if (options.checkRefererAndCallback) {
+    if (!isAllowedLootlabsReferer(req)) {
+      burnSession(sid);
+      return { ok: false, reason: "Bypass or invalid referrer detected." };
+    }
+
+    if (session.encryptedMode) {
+      const cb = String(req.query.cb || "");
+      if (!cb || cb !== session.cb) {
+        burnSession(sid);
+        return { ok: false, reason: "Invalid callback token." };
+      }
+    }
   }
 
   const elapsed = Date.now() - session.createdAt;
   if (elapsed < MIN_TASK_MS) {
+    burnSession(sid);
     return { ok: false, reason: "Checkpoint completed too fast." };
   }
 
   if (elapsed > SESSION_TTL_MS) {
-    pendingSessions.delete(sid);
-    return { ok: false, reason: "Checkpoint session timed out." };
+    burnSession(sid);
+    return { ok: false, reason: "Session timed out." };
   }
 
   return { ok: true, sid, session };
@@ -118,6 +147,25 @@ function generateKey() {
   const p2 = crypto.randomBytes(2).toString("hex").toUpperCase();
   const p3 = crypto.randomBytes(2).toString("hex").toUpperCase();
   return `SPH-${p1}-${p2}-${p3}`;
+}
+
+async function buildEncryptedLootlabsUrl(destinationUrl) {
+  if (!LOOTLABS_API_TOKEN) return null;
+  try {
+    const endpoint = `https://creators.lootlabs.gg/api/public/url_encryptor?destination_url=${encodeURIComponent(
+      destinationUrl
+    )}&api_token=${encodeURIComponent(LOOTLABS_API_TOKEN)}`;
+
+    const response = await fetch(endpoint, { method: "GET" });
+    const data = await response.json();
+    if (data && data.message && data.type !== "error") {
+      const sep = BASE_LOOTLABS_URL.includes("?") ? "&" : "?";
+      return `${BASE_LOOTLABS_URL}${sep}data=${data.message}`;
+    }
+  } catch (err) {
+    console.error("LootLabs encryptor error:", err.message);
+  }
+  return null;
 }
 
 setInterval(() => {
@@ -141,11 +189,9 @@ const SHARED_UI = `
     --border-bright: rgba(192, 132, 252, 0.48);
     --text: #faf7ff;
     --muted: #a79bc2;
-    --purple: #9333ea;
     --violet: #c084fc;
     --pink: #e879f9;
     --green: #34d399;
-    --red: #fb7185;
   }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -468,15 +514,13 @@ const SPARKLE_SCRIPT = `
   })();
 `;
 
-// Health check
 app.get("/health", (req, res) => {
-  res.status(200).json({ status: "ok", service: "spectre-hub" });
+  res.status(200).json({ status: "ok", encryptedAntiBypass: Boolean(LOOTLABS_API_TOKEN) });
 });
 
-// Ana Sayfa (Get Key)
 app.get("/", (req, res) => {
   const errorNotice = req.query.error === "bypass"
-    ? `<div class="warn-box">Bypass blocked. Click <strong>Get Key</strong> and complete the checkpoint in this browser.</div>`
+    ? `<div class="warn-box">Bypass blocked. Click <strong>Get Key</strong> and complete the task directly on LootLabs.</div>`
     : "";
 
   res.type("html").send(`<!DOCTYPE html>
@@ -522,7 +566,7 @@ app.get("/", (req, res) => {
       </svg>
     </a>
 
-    <div class="meta">24-Hour License &bull; Protected Session</div>
+    <div class="meta">24-Hour License &bull; Anti-Bypass Protected</div>
   </div>
 
   <script>${SPARKLE_SCRIPT}</script>
@@ -530,16 +574,24 @@ app.get("/", (req, res) => {
 </html>`);
 });
 
-// Anti-Bypass Oturum Başlatıcı
-app.get("/go", (req, res) => {
+app.get("/go", async (req, res) => {
   if (isAutomatedBot(req)) {
     return res.status(403).send("Automated requests are not allowed.");
   }
 
   const sid = crypto.randomBytes(16).toString("hex");
+  const cb = crypto.randomBytes(16).toString("hex");
+  const baseUrl = `${req.protocol}://${req.get("host")}`;
+  const callbackUrl = `${baseUrl}/claim?cb=${cb}`;
+
+  const encryptedUrl = await buildEncryptedLootlabsUrl(callbackUrl);
+
   pendingSessions.set(sid, {
     createdAt: Date.now(),
     fingerprint: getClientFingerprint(req),
+    cb,
+    encryptedMode: Boolean(encryptedUrl),
+    verified: false,
     used: false
   });
 
@@ -548,10 +600,10 @@ app.get("/go", (req, res) => {
     "Set-Cookie",
     `sp_sid=${encodeURIComponent(signedSid)}; Path=/; Max-Age=1800; HttpOnly; SameSite=Lax`
   );
-  return res.redirect(302, LOOTLABS_URL);
+
+  return res.redirect(302, encryptedUrl || BASE_LOOTLABS_URL);
 });
 
-// Claim Key Ekranı
 app.get("/claim", (req, res) => {
   const cookies = parseCookies(req);
   const existingKey = cookies.sp_key;
@@ -559,10 +611,12 @@ app.get("/claim", (req, res) => {
   const hasActiveKey = existingRecord && existingRecord.expiresAt > Date.now();
 
   if (!hasActiveKey) {
-    const check = validateCheckpointSession(req);
+    const check = validateCheckpoint(req, { checkRefererAndCallback: true });
     if (!check.ok) {
+      res.setHeader("Set-Cookie", "sp_sid=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
       return res.redirect(302, "/?error=bypass");
     }
+    check.session.verified = true;
   }
 
   res.type("html").send(`<!DOCTYPE html>
@@ -782,7 +836,6 @@ app.get("/claim", (req, res) => {
 </html>`);
 });
 
-// Tek Kullanımlık Oturum Yakan Key API
 app.post("/api/claim-key", (req, res) => {
   if (isAutomatedBot(req)) {
     return res.status(403).json({ error: "Automated requests blocked." });
@@ -798,14 +851,13 @@ app.post("/api/claim-key", (req, res) => {
     }
   }
 
-  const check = validateCheckpointSession(req);
-  if (!check.ok) {
-    return res.status(403).json({ error: check.reason });
+  const check = validateCheckpoint(req, { checkRefererAndCallback: false });
+  if (!check.ok || !check.session.verified) {
+    return res.status(403).json({ error: "Bypass blocked." });
   }
 
-  // Oturumu tek seferlik yak (tekrar kullanılamaz)
   check.session.used = true;
-  pendingSessions.delete(check.sid);
+  burnSession(check.sid);
 
   const key = generateKey();
   const expiresAt = Date.now() + KEY_TTL_MS;
@@ -819,7 +871,6 @@ app.post("/api/claim-key", (req, res) => {
   return res.status(200).json({ key, expiresAt });
 });
 
-// Lua Script Key Doğrulama Ucu
 app.get("/api/verify-key", (req, res) => {
   const key = String(req.query.key || "").trim();
   const record = activeKeys.get(key);
