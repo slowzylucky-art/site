@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spectre Hub — Key System</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', sans-serif; }
+    body {
+      background: #0b0d13;
+      color: #f1f5f9;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .card {
+      background: #131722;
+      border: 1px solid #23293a;
+      border-radius: 16px;
+      padding: 32px 26px;
+      max-width: 440px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 20px 45px rgba(0, 0, 0, 0.5);
+    }
+    .badge {
+      display: inline-block;
+      background: rgba(249, 115, 22, 0.14);
+      color: #fb923c;
+      border: 1px solid rgba(249, 115, 22, 0.35);
+      padding: 5px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 14px;
+    }
+    h1 { font-size: 24px; margin-bottom: 8px; }
+    p.sub { color: #94a3b8; font-size: 14px; line-height: 1.5; margin-bottom: 22px; }
+
+    /* Varsayılan olarak gizli — sadece bypass tespit edilirse görünür */
+    .bypass-alert {
+      display: none;
+      background: rgba(239, 68, 68, 0.14);
+      border: 1px solid #ef4444;
+      color: #fca5a5;
+      padding: 14px;
+      border-radius: 10px;
+      font-size: 13px;
+      line-height: 1.45;
+      margin-bottom: 18px;
+      text-align: left;
+    }
+    .bypass-alert strong { color: #f87171; display: block; margin-bottom: 4px; font-size: 14px; }
+
+    .btn {
+      display: block;
+      width: 100%;
+      background: linear-gradient(135deg, #f97316, #ea580c);
+      color: #fff;
+      text-decoration: none;
+      font-weight: 600;
+      padding: 14px;
+      border-radius: 10px;
+      border: none;
+      cursor: pointer;
+      font-size: 15px;
+      transition: opacity 0.2s;
+    }
+    .btn:hover { opacity: 0.92; }
+
+    .key-box {
+      display: none;
+      margin-top: 18px;
+      background: #0b0d13;
+      border: 1px solid #2e364f;
+      border-radius: 10px;
+      padding: 14px;
+    }
+    .key-value {
+      font-family: monospace;
+      font-size: 16px;
+      color: #34d399;
+      word-break: break-all;
+      margin-bottom: 10px;
+    }
+    .copy-btn {
+      background: #1e293b;
+      color: #e2e8f0;
+      border: 1px solid #334155;
+      padding: 8px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <span class="badge">Powered by Linkvertise</span>
+    <h1>Spectre Hub Key System</h1>
+    <p class="sub">24 saatlik erişim anahtarını almak için Linkvertise doğrulama adımını tamamla.</p>
+
+    <!-- Sadece bypass denemesi olduğunda JS ile aktifleşir -->
+    <div id="bypassAlert" class="bypass-alert">
+      <strong>Anti-Bypass Koruması Devrede</strong>
+      Linkvertise adımlarını atlamaya veya doğrudan erişmeye çalıştığın tespit edildi. Key almak için aşağıdaki butondan adımları normal şekilde tamamla.
+    </div>
+
+    <a id="getKeyBtn" class="btn" href="https://link-center.net/7515066/rJSFrXtZmWTV">
+      Linkvertise ile Key Al
+    </a>
+
+    <div id="keyBox" class="key-box">
+      <div id="keyText" class="key-value"></div>
+      <button class="copy-btn" onclick="copyKey()">Key'i Kopyala</button>
+    </div>
+  </div>
+
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const error = params.get("error");
+    const key = params.get("key");
+
+    if (error === "bypass") {
+      document.getElementById("bypassAlert").style.display = "block";
+    }
+
+    if (key) {
+      document.getElementById("keyBox").style.display = "block";
+      document.getElementById("keyText").textContent = key;
+      document.getElementById("getKeyBtn").textContent = "Yeni Key Al (Linkvertise)";
+    }
+
+    // URL çubuğundaki ?error= veya ?key= parametrelerini temizle
+    if (error || key) {
+      window.history.replaceState({}, document.title, "/");
+    }
+
+    function copyKey() {
+      const text = document.getElementById("keyText").textContent;
+      navigator.clipboard.writeText(text);
+      const btn = document.querySelector(".copy-btn");
+      btn.textContent = "Kopyalandı!";
+      setTimeout(() => (btn.textContent = "Key'i Kopyala"), 2000);
+    }
+  </script>
+</body>
+</html>
